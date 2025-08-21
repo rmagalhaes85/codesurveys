@@ -35,6 +35,7 @@ type snippetTuple struct {
 }
 
 type experiment struct {
+	Language string
 	Categories []string `yaml:categories`
 	SnippetTuples []*snippetTuple
 }
@@ -106,7 +107,7 @@ func loadExperimentFromDisk(experimentDir string) (exp *experiment, err error) {
 
 	for _, experimentFile := range experimentFiles {
 		path := filepath.Join(experimentDir, experimentFile.Name())
-		snippetTuple, err := parseSnippetTupleIfValid(path, exp.Categories)
+		snippetTuple, err := parseSnippetTupleIfValid(path, exp)
 		if err != nil {
 			return nil, err
 		}
@@ -176,7 +177,7 @@ func experimentIsValid(exp *experiment) error {
 	return nil
 }
 
-func parseSnippetTupleIfValid(path string, categories []string) (st *snippetTuple, err error) {
+func parseSnippetTupleIfValid(path string, exp *experiment) (st *snippetTuple, err error) {
 	// -- caso o subdiretório tenha um arquivo snippets.yaml
 	// -- carregar um objeto snippetTuple com os dados de snippets.yaml
 	// -- para cada arquivo nesse subdiretório
@@ -236,9 +237,7 @@ func parseSnippetTupleIfValid(path string, categories []string) (st *snippetTupl
 		st.Snippets = append(st.Snippets, s)
 	}
 
-	fmt.Printf("categories = %v\n", categories)
-	fmt.Printf("st = %w\n", st)
-	if !categoriesMatch(categories, st.Categories) {
+	if !categoriesMatch(exp.Categories, st.Categories) {
 		// TODO make error message more informative
 		err = errors.New("Categories don't match")
 		return
@@ -246,7 +245,7 @@ func parseSnippetTupleIfValid(path string, categories []string) (st *snippetTupl
 
 	// we leave the actual snippet's contents loading for the end, after all the
 	// snippet tuples have been validated
-	err = loadSnippetsContents(st)
+	err = loadSnippetsContents(st, exp)
 	if err != nil {
 		return
 	}
@@ -258,14 +257,15 @@ func getFilenameWithoutExt(originalName string) string {
 	return strings.TrimSuffix(originalName, path.Ext(originalName))
 }
 
-func loadSnippetsContents(st *snippetTuple) error {
+func loadSnippetsContents(st *snippetTuple, exp *experiment) error {
 	var buf bytes.Buffer
 	for _, s := range st.Snippets {
 		content, err := os.ReadFile(s.OriginalFilepath)
 		if err != nil {
 			return err
 		}
-		err = quick.Highlight(&buf, string(content), "python", "html", "monokai")
+		language := determineLanguage(s, st, exp)
+		err = quick.Highlight(&buf, string(content), language, "html", "monokai")
 		if err != nil {
 			return err
 		}
@@ -273,6 +273,25 @@ func loadSnippetsContents(st *snippetTuple) error {
 	}
 
 	return nil
+}
+
+func determineLanguage(s *snippet, st *snippetTuple, exp *experiment) string {
+	snippetLanguage := strings.TrimSpace(s.Language)
+	stLanguage := strings.TrimSpace(st.Language)
+	expLanguage := strings.TrimSpace(exp.Language)
+
+	if len(snippetLanguage) > 0 {
+		return snippetLanguage
+	}
+	if len(stLanguage) > 0 {
+		return stLanguage
+	}
+	if len(expLanguage) > 0 {
+		return expLanguage
+	}
+	// TODO try to determine language based on file extension
+	// (path.Ext(s.OriginalFilepath))
+	return ""
 }
 
 func categoriesMatch(cat1 []string, cat2 []string) bool {

@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	if err := importer.ImportSnippets("/tmp/experiment1/"); err != nil {
+	if err := importer.ImportExperiment("/tmp/experiment1/"); err != nil {
 		log.Fatalf("Error: %v", err)
 	}
 
