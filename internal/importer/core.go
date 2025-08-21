@@ -1,10 +1,10 @@
 package importer
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
-	_ "io/fs"
 	"io/ioutil"
 	"log"
 	"os"
@@ -14,233 +14,284 @@ import (
 	"strings"
 
 	_ "github.com/lib/pq"
+	"github.com/alecthomas/chroma/v2/quick"
 	"gopkg.in/yaml.v3"
 )
 
-type Snippet struct {
+const connStr = "postgres://elsendi:fusquinha@localhost:5432/readability?sslmode=disable"
+
+type snippet struct {
 	Language string
-	OriginalFilename string
+	OriginalFilepath string
 	Category string
 	Content string
 }
 
-type SnippetTuple struct {
+type snippetTuple struct {
 	Language string
 	OriginalPath string
-	Snippets []*Snippet
+	Snippets []*snippet
+	Categories []string
 }
 
-type Experiment struct {
+type experiment struct {
 	Categories []string `yaml:categories`
-	SnippetTuples []*SnippetTuple
+	SnippetTuples []*snippetTuple
 }
 
-func (exp Experiment) CategoriesMatch(categories []string) bool {
-	if len(exp.Categories) != len(categories) {
+func ImportExperiment(experimentDir string) (err error) {
+	log.Print("Importing experiment...")
+
+	var db *sql.DB
+	db, err = connectAndValidateDb()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	var exp *experiment
+	exp, err = loadExperimentFromDisk(experimentDir)
+	if err != nil {
+		return
+	}
+
+	err = storeExperiment(db, exp)
+
+	log.Print("The experiment was successfully imported")
+	return
+}
+
+func connectAndValidateDb() (db *sql.DB, err error) {
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		return
+	}
+
+	var initialized bool
+	initialized, err = isDbInitialized(db)
+	if err != nil {
+		return nil, err
+	}
+	if initialized {
+		return nil, errors.New("Database is already initialized")
+	}
+
+	return
+}
+
+func isDbInitialized(db *sql.DB) (bool, error) {
+	var workingSetCount int
+	err := db.QueryRow("select count(*) from working_sets").Scan(&workingSetCount)
+
+	if err != nil {
+		return false, errors.New("Query to check if database is initialized failed")
+	}
+
+	return (workingSetCount > 0), nil
+}
+
+func loadExperimentFromDisk(experimentDir string) (exp *experiment, err error) {
+	const snippetTupleDescriptorFilename = "snippets.yaml"
+
+	exp, err = parseExperimentIfValid(experimentDir)
+	if err != nil {
+		return
+	}
+
+	var experimentFiles []os.DirEntry
+	experimentFiles, err = os.ReadDir(experimentDir)
+	if err != nil {
+		return
+	}
+
+	for _, experimentFile := range experimentFiles {
+		path := filepath.Join(experimentDir, experimentFile.Name())
+		snippetTuple, err := parseSnippetTupleIfValid(path, exp.Categories)
+		if err != nil {
+			return nil, err
+		}
+		if snippetTuple == nil {
+			continue
+		}
+		fmt.Println("snippetTuple = %v", snippetTuple)
+		exp.SnippetTuples = append(exp.SnippetTuples, snippetTuple)
+	}
+
+	fmt.Printf("len(exp.SnippetTuples) = %v\n", len(exp.SnippetTuples))
+	fmt.Printf("exp.SnippetTuples[0] = %v\n", exp.SnippetTuples[0])
+	//fmt.Printf("len(exp.SnippetTuples[0].Snippets) = %v\n", len(exp.SnippetTuples[0].Snippets))
+
+	return
+}
+
+func parseExperimentIfValid(experimentDir string) (exp *experiment, err error) {
+	const experimentDescriptorFilename = "experiment.yaml"
+	info, err := os.Stat(experimentDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("The directory %s doesn't exist", experimentDir)
+		}
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("The path %s is not a directory", experimentDir)
+	}
+
+	experimentDescriptorPath := filepath.Join(experimentDir, experimentDescriptorFilename)
+	info, err = os.Stat(experimentDescriptorPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("The experiment descriptor experiment.yaml file doesn't exist")
+		}
+		return nil, fmt.Errorf("Error checking experiment.yaml file: %w", err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("The file %s exists but it's a directory", experimentDescriptorPath)
+	}
+
+	buf, err := ioutil.ReadFile(experimentDescriptorPath)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading experiment descriptor file: %w", err)
+	}
+	exp = &experiment{}
+	err = yaml.Unmarshal(buf, exp)
+	if err != nil {
+		return nil, fmt.Errorf("Error unmarshalling exp yaml: %w", err)
+	}
+
+	fmt.Printf("experimentDescriptorPath = %s\n", experimentDescriptorPath)
+	fmt.Printf("exp = %v\n", exp)
+	fmt.Printf("buf = %v\n", string(buf))
+	err = experimentIsValid(exp)
+	if err != nil {
+		return nil, err
+	}
+
+	return exp, nil
+}
+
+func experimentIsValid(exp *experiment) error {
+	if len(exp.Categories) < 2 {
+		return fmt.Errorf("Expected more than 1 category in the experiment. Found only %d", len(exp.Categories))
+	}
+	return nil
+}
+
+func parseSnippetTupleIfValid(path string, categories []string) (st *snippetTuple, err error) {
+	// -- caso o subdiretório tenha um arquivo snippets.yaml
+	// -- carregar um objeto snippetTuple com os dados de snippets.yaml
+	// -- para cada arquivo nesse subdiretório
+	// --- carregar os dados do arquivo e gerar um snippet formatado
+	// --- armazenar esses dados num objeto snippet
+	// --- adicionar esse snippet a snippetTuple-mae
+	// -- validar que o snippetTuple tem snippets correspondendo eatamente às
+	// categorias informadas no experiment.yaml
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("Directory %s doesn't exist", path)
+		}
+		return nil, err
+	}
+	if !info.IsDir() {
+		// this function has probably received a path for a FILE in the experiment
+		// folder. Here, we're only interested in subfolders
+		return nil, nil
+	}
+
+	const snippetDescriptorFilename = "snippets.yaml"
+	var snippetDescriptorPath = filepath.Join(path, snippetDescriptorFilename)
+	info, err = os.Stat(snippetDescriptorPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// simply ignore the directory in case there's no snippets.yaml file
+			return nil, nil
+		}
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("The snippet descriptor file exists, but is a directory (%s)", snippetDescriptorPath)
+	}
+
+	var snippetTupleFiles []os.DirEntry
+	snippetTupleFiles, err = os.ReadDir(path)
+	if err != nil {
+		return
+	}
+
+	st = &snippetTuple{}
+	// if the <path> directory contains a snippet descriptor file (snippets.yaml), the
+	// system assumes every other files in the folder to be source code snippets files
+	for _, stFile := range snippetTupleFiles {
+		if stFile.Name() == snippetDescriptorFilename {
+			continue
+		}
+		var stFileCategory = getFilenameWithoutExt(stFile.Name())
+		var s *snippet
+		s = &snippet{
+			Category: stFileCategory,
+			OriginalFilepath: filepath.Join(path, stFile.Name()),
+		}
+		st.Categories = append(st.Categories, stFileCategory)
+		st.Snippets = append(st.Snippets, s)
+	}
+
+	fmt.Printf("categories = %v\n", categories)
+	fmt.Printf("st = %w\n", st)
+	if !categoriesMatch(categories, st.Categories) {
+		// TODO make error message more informative
+		err = errors.New("Categories don't match")
+		return
+	}
+
+	// we leave the actual snippet's contents loading for the end, after all the
+	// snippet tuples have been validated
+	err = loadSnippetsContents(st)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func getFilenameWithoutExt(originalName string) string {
+	return strings.TrimSuffix(originalName, path.Ext(originalName))
+}
+
+func loadSnippetsContents(st *snippetTuple) error {
+	var buf bytes.Buffer
+	for _, s := range st.Snippets {
+		content, err := os.ReadFile(s.OriginalFilepath)
+		if err != nil {
+			return err
+		}
+		err = quick.Highlight(&buf, string(content), "python", "html", "monokai")
+		if err != nil {
+			return err
+		}
+		s.Content = buf.String()
+	}
+
+	return nil
+}
+
+func categoriesMatch(cat1 []string, cat2 []string) bool {
+	if cat1 == nil || cat2 == nil {
 		return false
 	}
-	for _, cat := range(categories) {
-		if !slices.Contains(exp.Categories, cat) {
+	if len(cat1) != len(cat2) {
+		return false
+	}
+	for _, cat := range(cat1) {
+		if !slices.Contains(cat2, cat) {
 			return false
 		}
 	}
 	return true
 }
 
-func ImportSnippets(dir string) error {
-	connStr := "postgres://elsendi:fusquinha@localhost:5432/readability?sslmode=disable"
-
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatalf("Failed to open database connection: %v", err)
-		return err
-	}
-	log.Print("Database connection established")
-	defer db.Close()
-
-	var version string
-	err = db.QueryRow("select version()").Scan(&version)
-	if err != nil {
-		log.Fatalf("Query failed: %v", err)
-		return err
-	}
-
-	// ensure database is not initialized with a set of snippets
-	err = checkDbNotInitialized(db)
-	if err != nil {
-		log.Fatalf("Error validating database: %v", err)
-		return err
-	}
-
-	//experiment1 := &Experiment{
-	//	Categories: []string{"a", "c"},
-	//}
-	//fmt.Printf("Categories match? %v\n", experiment1.CategoriesMatch([]string{"a", "b"}))
-	//var experiment *Experiment
-	//if experiment == nil {
-	//	fmt.Println("Experiment ainda eh nil")
-	//	return nil
-	//}
-
-	// determine snippets directory
-	err = validateSnippetsDirectory(dir)
-	if err != nil {
-		log.Fatalf("Can't access snippets directory %s: %v", dir, err)
-		return err
-	}
-
-
+func storeExperiment(db *sql.DB, exp *experiment) (err error) {
+	_ = db
+	_ = exp
 	return nil
 }
-
-func readExperiment(experimentFilePath string) (*Experiment, error) {
-	buf, err := ioutil.ReadFile(experimentFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("Error reading experiment descriptor file: %w", err)
-	}
-
-	experiment := &Experiment{}
-	err = yaml.Unmarshal(buf, experiment)
-	if err != nil {
-		return nil, fmt.Errorf("Error unmarshalling experiment yaml: %w", err)
-	}
-
-	return experiment, nil
-}
-
-func checkDbNotInitialized(db *sql.DB) error {
-	var workingSetCount int
-	err := db.QueryRow("select count(*) from working_sets").Scan(&workingSetCount)
-
-	if err != nil {
-		return errors.New("Query to check if database is initialized failed")
-	}
-	if workingSetCount > 0 {
-		return errors.New("Database is already initialized")
-	}
-
-	return nil
-}
-
-func validateSnippetsDirectory(dir string) error {
-	const experimentFilename = "experiment.yaml"
-	const snippetDescriptorFilename = "snippets.yaml"
-
-	info, err := os.Stat(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("The directory %s doesn't exist", dir)
-		}
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("The path %s is not a directory", dir)
-	}
-
-	experimentFilePath := filepath.Join(dir, experimentFilename)
-	info, err = os.Stat(experimentFilePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("The experiment descriptor experiment.yaml file doesn't exist")
-		}
-		return fmt.Errorf("Error checking experiment.yaml file: %w", err)
-	}
-	if info.IsDir() {
-		return fmt.Errorf("The file %s exists but it's a directory", experimentFilePath)
-	}
-
-	var experiment *Experiment
-	experiment, err = readExperiment(experimentFilePath)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Experiment read: %w", experiment)
-
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	for _, file := range files {
-		if file.IsDir() {
-			var descriptorFilename = filepath.Join(dir, file.Name(), snippetDescriptorFilename)
-			log.Printf("Checking file %s", descriptorFilename)
-			_, err := os.Stat(descriptorFilename)
-			if err != nil {
-				if os.IsNotExist(err) {
-					continue
-				}
-				return fmt.Errorf("Error checking for %s file", snippetDescriptorFilename)
-			}
-
-			snippetsDir, err := os.ReadDir(filepath.Join(dir, file.Name()))
-			if err != nil {
-				return fmt.Errorf("Error opening directory %v", file.Name())
-			}
-			log.Print("Found a directory with snippets")
-
-			var listOfCategories []string
-			for _, snippetFile := range snippetsDir {
-				fileWithoutExt := strings.TrimSuffix(snippetFile.Name(), path.Ext(snippetFile.Name()))
-				if fileWithoutExt == "snippets" {
-					continue
-				}
-				listOfCategories = append(listOfCategories, fileWithoutExt)
-			}
-
-			if !experiment.CategoriesMatch(listOfCategories) {
-				return fmt.Errorf("Categories in the experiment descriptor don't match with files in the %s directory. Categories: %v",
-					filepath.Join(dir, file.Name()), listOfCategories)
-			}
-		}
-	}
-
-	//var experiment Experiment
-	//var firstSnippetTuple = true
-
-	//err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-	//	if err != nil {
-	//		return err
-	//	}
-
-	//	if info, err = os.Stat(filepath.Join(path, snippetDescriptorFilename)); err != nil {
-	//		if os.IsNotExist(err) {
-	//			return filepath.SkipDir
-	//		}
-	//		return err
-	//	}
-
-	//	return nil
-	//})
-
-	//if err != nil {
-	//	return err
-	//}
-
-	return nil
-}
-
-
-	// for the first tuple of snippets
-
-	// - determine how many snippets are there in the tuple. There must be more than
-	// one.
-
-	// - determine the category represented by each snippet in the tuple. This
-	// category is named after the base file name of the snippet file. There should be
-	// an extension in each snippet file too -- the language and therefore the syntax
-	// highlighting rules will be selected after it.
-
-	// for each snippet tuple
-
-	// - ensure that the number of snippets is the same as the first snippets tuple
-
-	// - ensure that the snippets category names correspond exactly to the categories
-	// in the first snippets tuple
-
-	// - ensure no snippet in the tuple is empty
-
-	// - determine snippet language from the file extension
-
-	// - generate an HTML syntax-highlighted version of the snippet
-
-	// - store it in the database
